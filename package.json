@@ -1,7 +1,7 @@
 {
   "name": "ayugram-server",
-  "version": "1.0.0",
-  "description": "AyuGram Pro Server",
+  "version": "1.1.0",
+  "description": "AyuGram Pro Server — WebSocket messenger backend (Render-ready)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
