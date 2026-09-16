@@ -6,62 +6,83 @@ const path = require('path');
 
 const port = process.env.PORT || 8080;
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'db.json');
+const MAX_PAYLOAD = 8 * 1024 * 1024;          // лимит одного WS-кадра (чанки мелкие)
+const HISTORY_CAP = 300;                       // сообщений на ветку чата
+const MAX_MEDIA = 80 * 1024 * 1024;           // лимит base64-файла (~60 МБ)
 
-const httpServer = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
-    res.end('AyuGram Pro Server OK');
-    return;
-  }
-  res.writeHead(404); res.end('Not Found');
-});
-const wss = new WebSocket.Server({ server: httpServer, maxPayload: 100 * 1024 * 1024 });
-
-// ── БД на диске ──
-let db = { users: {}, history: {}, offline: {} };
+// ── БД на диске (переживает sleep/wake Render) ──
+let db = { users: {}, history: {}, groups: {} };
 try { if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { console.error('DB load fail:', e.message); }
-const users = db.users || (db.users = {});
+const users   = db.users   || (db.users = {});
 const history = db.history || (db.history = {});
-const offline = db.offline || (db.offline = {});
+const groups  = db.groups  || (db.groups = {});
+
+const activeSockets = {};   // username → [ws, ws, ...] (МУЛЬТИ-ДЕВАЙС)
+const sessions = {};        // token → username
+const uploads = {};         // uploadId → { meta, parts[], size }
+
 let saveTimer = null;
-function saveDB() {
+function persist() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e) { console.error('DB save fail:', e.message); } }, 400);
+  saveTimer = setTimeout(() => {
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e) { console.error('DB save fail:', e.message); }
+  }, 800);
 }
 
-const activeSockets = {};
-const sessions = {};
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ ok: true, users: Object.keys(users).length, online: Object.keys(activeSockets).length }));
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+  res.end('AyuGram Pro Server OK');
+});
+const wss = new WebSocket.Server({ server: httpServer, maxPayload: MAX_PAYLOAD });
+
 console.log(`🚀 AyuGram Pro сервер запущен на порту ${port}`);
 
 setInterval(() => {
-  http.get(`http://localhost:${port}/health`, () => {}).on('error', () => {});
+  http.get(`http://localhost:${port}/health`, () => {});
   wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.ping(); });
 }, 14 * 60 * 1000);
 
 function hashPassword(password, salt) { return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
-function broadcast(data) { const p = JSON.stringify(data); wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(p); }); }
+function genId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
+function socketsOf(u) { return activeSockets[u] || []; }
+function sendToAll(u, data) { const s = JSON.stringify(data); socketsOf(u).forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(s); }); }
 function broadcastUserList() {
-  broadcast({ type: 'user_list', users: Object.keys(users).map(u => ({ username: u, displayName: users[u].displayName, avatar: users[u].avatar, bio: users[u].bio, online: !!activeSockets[u], lastSeen: users[u].lastSeen })) });
+  const list = Object.keys(users).map(u => ({ username: u, displayName: users[u].displayName, avatar: users[u].avatar, bio: users[u].bio, online: socketsOf(u).length > 0, lastSeen: users[u].lastSeen }));
+  const s = JSON.stringify({ type: 'user_list', users: list });
+  wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(s); });
 }
-function sendTo(username, data) {
-  const sock = activeSockets[username];
-  if (sock && sock.readyState === WebSocket.OPEN) { sock.send(JSON.stringify(data)); return true; }
-  return false;
+function getProfile(u) { const x = users[u]; return { displayName: x.displayName, avatar: x.avatar, bio: x.bio }; }
+function audience(to, from) {
+  if (to === 'Избранное' || to === from) return [from];
+  if (groups[to]) return groups[to].members || [];
+  return [to, from];
 }
-function histKey(me, other) { return other === 'Избранное' ? me + '|saved' : [me, other].sort().join('|'); }
-function pushHistory(msg) {
-  const key = histKey(msg.from, msg.to);
+function branchKey(from, to, groupId) {
+  if (groupId) return groupId;
+  if (to === 'Избранное') return from + '|saved';
+  return [from, to].sort().join('|');
+}
+function deliverMessage(from, p, mediaOverride) {
+  const msg = {
+    type: 'new_message', id: genId(), ts: Date.now(),
+    from, to: p.to, groupId: p.groupId, groupName: p.groupName,
+    text: p.text || '', media: mediaOverride !== undefined ? mediaOverride : p.media,
+    mediaType: p.mediaType, fileName: p.fileName, voice: p.voice,
+    replyTo: p.replyTo, replyText: p.replyText,
+    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    reactions: {}
+  };
+  const key = branchKey(from, p.to, p.groupId);
   (history[key] = history[key] || []).push(msg);
-  if (history[key].length > 300) history[key] = history[key].slice(-300);
-  saveDB();
+  if (history[key].length > HISTORY_CAP) history[key] = history[key].slice(-HISTORY_CAP);
+  persist();
+  audience(p.to, from).forEach(u => sendToAll(u, msg));   // всем устройствам обеих сторон
 }
-function queueOffline(username, msg) {
-  (offline[username] = offline[username] || []).push(msg);
-  if (offline[username].length > 100) offline[username] = offline[username].slice(-100);
-  saveDB();
-}
-function getProfile(username) { const u = users[username]; return { displayName: u.displayName, avatar: u.avatar, bio: u.bio }; }
 
 wss.on('connection', (ws) => {
   let myUsername = null;
@@ -70,7 +91,6 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const p = JSON.parse(message.toString());
-      if (p.type === 'ping') { try { ws.send(JSON.stringify({ type: 'pong' })); } catch(e){} return; }
 
       if (p.type === 'register') {
         const username = (p.username || '').trim().toLowerCase();
@@ -82,7 +102,7 @@ wss.on('connection', (ws) => {
         if (users[username]) return ws.send(JSON.stringify({ type: 'error', code: 'register', text: 'Имя пользователя занято' }));
         const salt = crypto.randomBytes(16).toString('hex');
         users[username] = { displayName: displayName || username, avatar: null, bio: 'Использую AyuGram', passwordHash: hashPassword(password, salt), salt, createdAt: Date.now(), online: false, lastSeen: null };
-        saveDB();
+        persist();
         console.log(`✅ Зарегистрирован: ${username}`);
         ws.send(JSON.stringify({ type: 'register_success', username }));
       }
@@ -94,13 +114,22 @@ wss.on('connection', (ws) => {
           return doLogin(ws, uname, p.token);
         }
         const username = (p.username || '').trim().toLowerCase();
-        const password = p.password || '';
         if (!users[username]) return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Пользователь не найден' }));
         const { passwordHash, salt } = users[username];
-        if (hashPassword(password, salt) !== passwordHash) return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Неверный пароль' }));
-        const token = generateToken();
-        sessions[token] = username;
+        if (hashPassword(p.password || '', salt) !== passwordHash) return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Неверный пароль' }));
+        const token = generateToken(); sessions[token] = username;
         doLogin(ws, username, token);
+      }
+
+      if (p.type === 'get_history') {
+        if (!myUsername) return;
+        const out = [];
+        Object.keys(history).forEach(k => {
+          if (k === myUsername + '|saved') out.push(...history[k]);
+          else if (groups[k] && (groups[k].members || []).includes(myUsername)) out.push(...history[k]);
+          else if (k.split('|').includes(myUsername)) out.push(...history[k]);
+        });
+        ws.send(JSON.stringify({ type: 'history', messages: out }));
       }
 
       if (p.type === 'update_profile') {
@@ -108,124 +137,112 @@ wss.on('connection', (ws) => {
         if (p.displayName) users[myUsername].displayName = p.displayName;
         if (p.bio !== undefined) users[myUsername].bio = p.bio;
         if (p.avatar !== undefined) users[myUsername].avatar = p.avatar;
-        saveDB();
+        persist();
         ws.send(JSON.stringify({ type: 'profile_updated', profile: getProfile(myUsername) }));
         broadcastUserList();
       }
 
       if (p.type === 'change_password') {
         if (!myUsername) return;
-        const { oldPassword, newPassword } = p;
         const { passwordHash, salt } = users[myUsername];
-        if (hashPassword(oldPassword, salt) !== passwordHash) return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Неверный старый пароль' }));
-        if (!newPassword || newPassword.length < 4) return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Новый пароль минимум 4 символа' }));
+        if (hashPassword(p.oldPassword || '', salt) !== passwordHash) return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Неверный старый пароль' }));
+        if (!p.newPassword || p.newPassword.length < 4) return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Новый пароль минимум 4 символа' }));
         const newSalt = crypto.randomBytes(16).toString('hex');
-        users[myUsername].passwordHash = hashPassword(newPassword, newSalt);
-        users[myUsername].salt = newSalt;
-        saveDB();
+        users[myUsername].passwordHash = hashPassword(p.newPassword, newSalt);
+        users[myUsername].salt = newSalt; persist();
         ws.send(JSON.stringify({ type: 'password_changed' }));
       }
 
-      if (p.type === 'get_history') {
-        if (!myUsername) return;
-        const key = histKey(myUsername, p.with);
-        ws.send(JSON.stringify({ type: 'history', with: p.with, messages: history[key] || [] }));
-      }
+      // ── СООБЩЕНИЕ (текст/голос/мелкий файл) ──
+      if (p.type === 'message') { if (myUsername) deliverMessage(myUsername, p, undefined); }
 
-      if (p.type === 'message') {
-        if (!myUsername) return;
-        const msg = {
-          type: 'new_message',
-          id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
-          from: myUsername, to: p.to,
-          groupId: p.groupId, groupName: p.groupName,
-          text: p.text, media: p.media, mediaType: p.mediaType, fileName: p.fileName, voice: p.voice,
-          replyTo: p.replyTo, replyText: p.replyText,
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          reactions: {}
-        };
-        pushHistory(msg);
-        if (p.to === 'Избранное') {
-          ws.send(JSON.stringify(msg));
-        } else if (p.groupId) {
-          const members = (global._groups && global._groups[p.groupId]) || [];
-          members.filter(m => m !== myUsername).forEach(m => { if (!sendTo(m, msg)) queueOffline(m, msg); });
-          ws.send(JSON.stringify(msg));
-        } else {
-          if (!sendTo(p.to, msg)) queueOffline(p.to, msg);
-          ws.send(JSON.stringify(msg));
+      // ── ЧАНКОВАЯ ЗАГРУЗКА БОЛЬШИХ ФАЙЛОВ (видео) ──
+      if (p.type === 'media_start') { uploads[p.uploadId] = { meta: p, parts: [], size: 0 }; }
+      if (p.type === 'media_chunk') {
+        const u = uploads[p.uploadId];
+        if (u) {
+          u.parts.push(p.data); u.size += p.data.length;
+          if (u.size > MAX_MEDIA) { delete uploads[p.uploadId]; ws.send(JSON.stringify({ type: 'error', code: 'media', text: 'Файл слишком большой' })); }
         }
+      }
+      if (p.type === 'media_end') {
+        const u = uploads[p.uploadId];
+        if (!u || !myUsername) return;
+        delete uploads[p.uploadId];
+        deliverMessage(myUsername, u.meta, u.parts.join(''));
       }
 
       if (p.type === 'edit_message') {
         if (!myUsername) return;
-        const key = histKey(myUsername, p.to);
+        const key = branchKey(myUsername, p.to, p.groupId);
         const m = (history[key] || []).find(x => x.id === p.messageId);
-        if (m) { m.text = p.newText; m.edited = true; saveDB(); }
-        const payload = { type: 'msg_edited', from: myUsername, to: p.to, messageId: p.messageId, newText: p.newText };
-        sendTo(p.to, payload); ws.send(JSON.stringify(payload));
+        if (m) { m.text = p.newText; m.edited = true; persist(); }
+        const payload = { type: 'msg_edited', from: myUsername, to: p.to, groupId: p.groupId, messageId: p.messageId, newText: p.newText };
+        audience(p.to, myUsername).forEach(u => sendToAll(u, payload));
       }
 
-      if (p.type === 'typing') { if (myUsername) sendTo(p.to, { type: 'typing', from: myUsername, groupId: p.groupId }); }
+      if (p.type === 'typing') {
+        if (!myUsername) return;
+        audience(p.to, myUsername).forEach(u => { if (u !== myUsername) sendToAll(u, { type: 'typing', from: myUsername, groupId: p.groupId }); });
+      }
 
       if (p.type === 'reaction') {
         if (!myUsername) return;
-        const key = histKey(myUsername, p.to);
+        const key = branchKey(myUsername, p.to, p.groupId);
         const m = (history[key] || []).find(x => x.id === p.messageId);
-        if (m) { m.reactions = m.reactions || {}; m.reactions[p.reaction] = (m.reactions[p.reaction] || 0) + 1; saveDB(); }
-        const payload = { type: 'new_reaction', from: myUsername, to: p.to, messageId: p.messageId, reaction: p.reaction };
-        if (p.to === 'Избранное') ws.send(JSON.stringify(payload));
-        else { sendTo(p.to, payload); ws.send(JSON.stringify(payload)); }
+        if (m) { m.reactions = m.reactions || {}; m.reactions[p.reaction] = (m.reactions[p.reaction] || 0) + 1; persist(); }
+        const payload = { type: 'new_reaction', from: myUsername, to: p.to, groupId: p.groupId, messageId: p.messageId, reaction: p.reaction };
+        audience(p.to, myUsername).forEach(u => sendToAll(u, payload));
       }
 
       if (p.type === 'pin_message') {
         if (!myUsername) return;
-        const payload = { type: 'message_pinned', from: myUsername, to: p.to, messageId: p.messageId, text: p.text };
-        if (p.to === 'Избранное') ws.send(JSON.stringify(payload));
-        else { sendTo(p.to, payload); ws.send(JSON.stringify(payload)); }
+        const payload = { type: 'message_pinned', from: myUsername, to: p.to, groupId: p.groupId, messageId: p.messageId, text: p.text };
+        audience(p.to, myUsername).forEach(u => sendToAll(u, payload));
       }
 
-      if (['call_offer','video_offer','call_answer','ice_candidate','call_end'].includes(p.type)) {
-        const target = activeSockets[p.to];
-        if (target && target.readyState === WebSocket.OPEN) { p.from = myUsername; target.send(JSON.stringify(p)); }
-        else if (['call_offer','video_offer'].includes(p.type)) ws.send(JSON.stringify({ type: 'call_end', from: p.to, reason: 'offline' }));
+      // ── ЗВОНКИ: сигналы всем устройствам цели ──
+      if (['call_offer', 'video_offer'].includes(p.type)) {
+        const t = socketsOf(p.to);
+        if (t.length) { p.from = myUsername; const s = JSON.stringify(p); t.forEach(x => { if (x.readyState === WebSocket.OPEN) x.send(s); }); }
+        else ws.send(JSON.stringify({ type: 'call_end', from: p.to, reason: 'offline' }));
+      }
+      if (['call_answer', 'ice_candidate', 'call_end'].includes(p.type)) {
+        p.from = myUsername;
+        const s = JSON.stringify(p);
+        socketsOf(p.to).forEach(x => { if (x.readyState === WebSocket.OPEN) x.send(s); });
       }
 
       if (p.type === 'group_created') {
         if (!myUsername) return;
-        if (p.groupData && p.groupData.members) {
-          if (!global._groups) global._groups = {};
-          global._groups[p.groupId] = p.groupData.members;
-        }
-        (p.groupData && p.groupData.members || []).forEach(m => {
-          if (m !== myUsername) sendTo(m, { type: 'group_invite', from: myUsername, groupId: p.groupId, groupData: p.groupData });
-        });
+        groups[p.groupId] = p.groupData; persist();
+        (p.groupData.members || []).forEach(m => { if (m !== myUsername) sendToAll(m, { type: 'group_invite', from: myUsername, groupId: p.groupId, groupData: p.groupData }); });
       }
     } catch (err) { console.error('Ошибка пакета:', err.message); }
   });
 
   ws.on('close', () => {
     if (myUsername) {
-      console.log(`💤 Отключился: ${myUsername}`);
-      delete activeSockets[myUsername];
-      if (users[myUsername]) { users[myUsername].online = false; users[myUsername].lastSeen = Date.now(); saveDB(); }
+      const arr = activeSockets[myUsername] || [];
+      const i = arr.indexOf(ws); if (i >= 0) arr.splice(i, 1);
+      if (!arr.length) {
+        delete activeSockets[myUsername];
+        if (users[myUsername]) { users[myUsername].online = false; users[myUsername].lastSeen = Date.now(); }
+        persist();
+      }
+      console.log(`💤 Отключился: ${myUsername} (осталось устройств: ${arr.length})`);
       broadcastUserList();
     }
   });
   ws.on('error', err => console.error('WS error:', err.message));
 
   function doLogin(ws, username, token) {
-    if (activeSockets[username] && activeSockets[username] !== ws) {
-      activeSockets[username].send(JSON.stringify({ type: 'kicked', text: 'Вы вошли с другого устройства' }));
-      activeSockets[username].close();
-    }
+    // БЕЗ кика: несколько устройств на одном аккаунте
+    (activeSockets[username] = activeSockets[username] || []).push(ws);
     myUsername = username;
-    activeSockets[username] = ws;
     users[username].online = true;
-    console.log(`👤 В сети: ${username}`);
+    console.log(`👤 В сети: ${username} (устройств: ${socketsOf(username).length})`);
     ws.send(JSON.stringify({ type: 'auth_success', username, token, profile: getProfile(username) }));
-    const q = offline[username];
-    if (q && q.length) { q.forEach(m => { try { ws.send(JSON.stringify(m)); } catch(e){} }); delete offline[username]; saveDB(); console.log(`📬 Выдано из оффлайна: ${q.length} → ${username}`); }
     broadcastUserList();
   }
 });
