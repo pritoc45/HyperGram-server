@@ -8,12 +8,16 @@ const port = process.env.PORT || 8080;
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'db.json');
 
 const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
-  res.end('AyuGram Pro Server OK');
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+    res.end('AyuGram Pro Server OK');
+    return;
+  }
+  res.writeHead(404); res.end('Not Found');
 });
 const wss = new WebSocket.Server({ server: httpServer, maxPayload: 100 * 1024 * 1024 });
 
-// ── БД на диске: пользователи + история + оффлайн-очередь ──
+// ── БД на диске ──
 let db = { users: {}, history: {}, offline: {} };
 try { if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { console.error('DB load fail:', e.message); }
 const users = db.users || (db.users = {});
@@ -30,7 +34,7 @@ const sessions = {};
 console.log(`🚀 AyuGram Pro сервер запущен на порту ${port}`);
 
 setInterval(() => {
-  http.get(`http://localhost:${port}`, () => {});
+  http.get(`http://localhost:${port}/health`, () => {}).on('error', () => {});
   wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.ping(); });
 }, 14 * 60 * 1000);
 
@@ -57,6 +61,7 @@ function queueOffline(username, msg) {
   if (offline[username].length > 100) offline[username] = offline[username].slice(-100);
   saveDB();
 }
+function getProfile(username) { const u = users[username]; return { displayName: u.displayName, avatar: u.avatar, bio: u.bio }; }
 
 wss.on('connection', (ws) => {
   let myUsername = null;
@@ -65,7 +70,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const p = JSON.parse(message.toString());
-      if (p.type === 'ping') return;
+      if (p.type === 'ping') { try { ws.send(JSON.stringify({ type: 'pong' })); } catch(e){} return; }
 
       if (p.type === 'register') {
         const username = (p.username || '').trim().toLowerCase();
@@ -143,8 +148,8 @@ wss.on('connection', (ws) => {
         if (p.to === 'Избранное') {
           ws.send(JSON.stringify(msg));
         } else if (p.groupId) {
-          // групповое: шлём всем участникам, оффлайн-юзерам — в очередь
-          (groups_members(p.groupId, myUsername)).forEach(m => { if (!sendTo(m, msg)) queueOffline(m, msg); });
+          const members = (global._groups && global._groups[p.groupId]) || [];
+          members.filter(m => m !== myUsername).forEach(m => { if (!sendTo(m, msg)) queueOffline(m, msg); });
           ws.send(JSON.stringify(msg));
         } else {
           if (!sendTo(p.to, msg)) queueOffline(p.to, msg);
@@ -188,6 +193,10 @@ wss.on('connection', (ws) => {
 
       if (p.type === 'group_created') {
         if (!myUsername) return;
+        if (p.groupData && p.groupData.members) {
+          if (!global._groups) global._groups = {};
+          global._groups[p.groupId] = p.groupData.members;
+        }
         (p.groupData && p.groupData.members || []).forEach(m => {
           if (m !== myUsername) sendTo(m, { type: 'group_invite', from: myUsername, groupId: p.groupId, groupData: p.groupData });
         });
@@ -215,31 +224,10 @@ wss.on('connection', (ws) => {
     users[username].online = true;
     console.log(`👤 В сети: ${username}`);
     ws.send(JSON.stringify({ type: 'auth_success', username, token, profile: getProfile(username) }));
-    // ✅ выдаём накопленные оффлайн-сообщения
     const q = offline[username];
-    if (q && q.length) { q.forEach(m => ws.send(JSON.stringify(m))); delete offline[username]; saveDB(); console.log(`📬 Выдано из оффлайна: ${q.length} → ${username}`); }
+    if (q && q.length) { q.forEach(m => { try { ws.send(JSON.stringify(m)); } catch(e){} }); delete offline[username]; saveDB(); console.log(`📬 Выдано из оффлайна: ${q.length} → ${username}`); }
     broadcastUserList();
   }
 });
 
-function groups_members(groupId, exclude) {
-  // члены группы приходят в group_created; храним на лету
-  if (!global._groups) global._groups = {};
-  return (global._groups[groupId] || []).filter(m => m !== exclude);
-}
-// запоминаем состав групп из group_created
-const _origOn = wss.on.bind(wss);
-wss.on('connection', (ws) => {
-  ws.on('message', (raw) => {
-    try {
-      const p = JSON.parse(raw.toString());
-      if (p.type === 'group_created' && p.groupData && p.groupData.members) {
-        if (!global._groups) global._groups = {};
-        global._groups[p.groupId] = p.groupData.members;
-      }
-    } catch (e) {}
-  });
-});
-
-function getProfile(username) { const u = users[username]; return { displayName: u.displayName, avatar: u.avatar, bio: u.bio }; }
 httpServer.listen(port, () => console.log(`HTTP + WS на порту ${port}`));
