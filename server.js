@@ -200,7 +200,7 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'password_changed' }));
       }
 
-      // ── GET HISTORY (новый тип, опционален для клиента) ──
+      // ── GET HISTORY ──
       if (p.type === 'get_history') {
         if (!myUsername) return;
         const key = historyKey(myUsername, p.with);
@@ -228,7 +228,7 @@ wss.on('connection', (ws) => {
           if (target && target.readyState === WebSocket.OPEN) {
             target.send(JSON.stringify(msg));
           } else {
-            (offline[p.to] = offline[p.to] || []).push(msg);   // ✅ оффлайн-очередь
+            (offline[p.to] = offline[p.to] || []).push(msg);   // оффлайн-очередь
           }
           ws.send(JSON.stringify(msg));
         }
@@ -314,7 +314,7 @@ wss.on('connection', (ws) => {
     users[username].online = true;
     console.log(`👤 В сети: ${username}`);
     ws.send(JSON.stringify({ type: 'auth_success', username, token, profile: getProfile(username) }));
-    // ✅ отдаём накопленные оффлайн-сообщения
+    // отдаём накопленные оффлайн-сообщения
     const queue = offline[username];
     if (queue && queue.length) {
       queue.forEach(m => ws.send(JSON.stringify(m)));
